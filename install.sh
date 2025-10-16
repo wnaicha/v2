@@ -1,188 +1,150 @@
 #!/bin/bash
-# =========================================
-# Trojan 一键安装脚本（自动 Docker + MariaDB + 证书）
-# 支持安装 / 卸载，只需输入域名即可完成全自动部署
-# =========================================
+# ============================================================
+# 自动安装 Docker + MariaDB + SSL (acme.sh)
+# 作者: GPT-5 改进版
+# ============================================================
 
 set -e
 
-red="31m"; green="32m"; yellow="33m"; blue="36m"; fuchsia="35m"
-colorEcho(){ echo -e "\033[${1}${@:2}\033[0m"; }
+# 彩色输出
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+RESET="\033[0m"
 
-# === 核心配置 ===
 DB_USER="adminaa"
 DB_PASS="wf1234567"
-DB_NAME="trojan"
-ADMIN_USER="adminaa"
-ADMIN_PASS="wf1234567"
-TROJAN_PORT=443
-CERT_PROVIDER="letsencrypt"
+DB_NAME="mydb"
 
-download_url="https://github.com/Jrohy/trojan/releases/download"
-version_check="https://api.github.com/repos/Jrohy/trojan/releases/latest"
-service_url="https://raw.githubusercontent.com/Jrohy/trojan/master/asset/trojan-web.service"
+echo -e "${BLUE}🔧 自动安装 Docker + MariaDB + SSL${RESET}"
+echo "----------------------------------------------"
+read -p "请输入绑定的域名（例如 example.com）: " DOMAIN
 
-# === 函数 ===
-checkSys(){
-    [ $(id -u) != "0" ] && { colorEcho ${red} "请以 root 用户运行脚本"; exit 1; }
-    if command -v apt-get >/dev/null; then
-        package_manager='apt-get'
-    elif command -v dnf >/dev/null; then
-        package_manager='dnf'
-    elif command -v yum >/dev/null; then
-        package_manager='yum'
-    else
-        colorEcho ${red} "不支持的系统"; exit 1
-    fi
-}
+if [ -z "$DOMAIN" ]; then
+    echo -e "${RED}❌ 域名不能为空${RESET}"
+    exit 1
+fi
 
-installDependent(){
-    colorEcho ${blue} "安装依赖（docker、acme.sh、curl 等）..."
-    if [[ ${package_manager} == "dnf" || ${package_manager} == "yum" ]]; then
-        ${package_manager} install -y epel-release
-        ${package_manager} install -y socat crontabs bash-completion curl wget
-        ${package_manager} install -y docker
-    else
-        ${package_manager} update -y
-        ${package_manager} install -y socat cron bash-completion curl wget xz-utils docker.io
-    fi
-    systemctl enable docker && systemctl start docker
-}
+# 获取公网 IP
+SERVER_IP=$(curl -s https://ipinfo.io/ip || curl -s https://api.ipify.org)
+echo -e "${BLUE}🌐 当前服务器公网 IP: ${RESET}${GREEN}$SERVER_IP${RESET}"
 
-readDomain(){
-    read -p "请输入你的域名 (example.com): " DOMAIN
-    DOMAIN="${DOMAIN// /}"
-    if [[ -z "$DOMAIN" ]]; then
-        colorEcho ${red} "域名不能为空"
-        exit 1
-    fi
-}
+# 检查域名解析
+DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
+if [ -z "$DOMAIN_IP" ]; then
+    echo -e "${RED}❌ 无法解析域名，请确认 DNS 已生效${RESET}"
+    exit 1
+fi
 
-installMariaDB(){
-    colorEcho ${blue} "安装 Docker 版 MariaDB..."
-    docker rm -f trojan-mariadb >/dev/null 2>&1 || true
-    mkdir -p /home/mariadb
-    docker run -d \
-        --name trojan-mariadb \
-        -p 3306:3306 \
-        -v /home/mariadb:/var/lib/mysql \
-        -e MYSQL_ROOT_PASSWORD=${DB_PASS} \
-        -e MYSQL_DATABASE=${DB_NAME} \
-        -e MYSQL_USER=${DB_USER} \
-        -e MYSQL_PASSWORD=${DB_PASS} \
-        --restart always mariadb:latest >/dev/null
-    sleep 10
-    colorEcho ${green} "MariaDB 已启动 → 数据库:${DB_NAME} 用户:${DB_USER} 密码:${DB_PASS}"
-}
+echo -e "${YELLOW}🔍 检测域名解析: ${RESET}$DOMAIN_IP"
+if [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
+    echo -e "${RED}❌ 域名未正确解析到本机！${RESET}"
+    echo "  你的域名解析 IP: $DOMAIN_IP"
+    echo "  服务器公网 IP:   $SERVER_IP"
+    echo -e "${YELLOW}请先将域名 A 记录解析到该 IP 再运行脚本。${RESET}"
+    exit 1
+fi
+echo -e "${GREEN}✅ 域名解析正确${RESET}"
+echo "----------------------------------------------"
 
-installAcme(){
-    if [[ ! -d /root/.acme.sh ]]; then
-        colorEcho ${blue} "安装 acme.sh..."
-        curl https://get.acme.sh | sh
-    fi
-    colorEcho ${blue} "申请 TLS 证书（Let's Encrypt）..."
-    ~/.acme.sh/acme.sh --issue -d ${DOMAIN} --standalone --force
-    ~/.acme.sh/acme.sh --install-cert -d ${DOMAIN} \
-        --fullchain-file /root/.acme.sh/${DOMAIN}/${DOMAIN}.cer \
-        --key-file /root/.acme.sh/${DOMAIN}/${DOMAIN}.key \
-        --reloadcmd "systemctl restart trojan-web" >/dev/null
-    colorEcho ${green} "证书申请成功。"
-}
+# 选择操作
+echo -e "${BLUE}请选择操作:${RESET}"
+echo "1️⃣  安装 Docker + MariaDB + SSL"
+echo "2️⃣  卸载所有相关组件"
+read -p "请输入 [1/2]: " OPTION
+echo "----------------------------------------------"
 
-installTrojan(){
-    colorEcho ${blue} "下载 Trojan 管理程序..."
-    lastest_version=$(curl -s "${version_check}" | grep '"tag_name"' | cut -d\" -f4)
-    [[ -z "$lastest_version" ]] && lastest_version="latest"
-    [[ $(uname -m) == "x86_64" ]] && bin="trojan-linux-amd64" || bin="trojan-linux-arm64"
-    curl -L "${download_url}/${lastest_version}/${bin}" -o /usr/local/bin/trojan
-    chmod +x /usr/local/bin/trojan
+# ------------------------------------------------------------
+# 卸载逻辑
+# ------------------------------------------------------------
+if [ "$OPTION" == "2" ]; then
+    echo -e "${YELLOW}🧹 开始卸载...${RESET}"
+    docker stop mariadb 2>/dev/null || true
+    docker rm mariadb 2>/dev/null || true
+    docker rmi mariadb:latest 2>/dev/null || true
+    rm -rf ~/.acme.sh
+    apt remove -y docker docker.io containerd runc || true
+    apt autoremove -y
+    echo -e "${GREEN}✅ 卸载完成${RESET}"
+    exit 0
+fi
 
-    mkdir -p /usr/local/etc/trojan
-    cat > /usr/local/etc/trojan/config.json <<EOF
-{
-  "domain": "${DOMAIN}",
-  "cert_provider": "${CERT_PROVIDER}",
-  "certs": {
-    "fullchain": "/root/.acme.sh/${DOMAIN}/${DOMAIN}.cer",
-    "privkey": "/root/.acme.sh/${DOMAIN}/${DOMAIN}.key"
-  },
-  "port": ${TROJAN_PORT},
-  "users": [
-    {
-      "username": "${ADMIN_USER}",
-      "password": "${ADMIN_PASS}",
-      "remark": "admin"
-    }
-  ],
-  "admin": {
-    "username": "${ADMIN_USER}",
-    "password": "${ADMIN_PASS}"
-  },
-  "database": {
-    "type": "mysql",
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "${DB_USER}",
-    "password": "${DB_PASS}",
-    "name": "${DB_NAME}"
-  }
-}
-EOF
+# ------------------------------------------------------------
+# 安装 Docker
+# ------------------------------------------------------------
+if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${BLUE}📦 安装 Docker...${RESET}"
+    apt update -y
+    apt install -y ca-certificates curl gnupg lsb-release
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+    https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt update -y
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable docker
+    systemctl start docker
+    echo -e "${GREEN}✅ Docker 安装完成${RESET}"
+else
+    echo -e "${GREEN}✅ Docker 已安装${RESET}"
+fi
 
-    curl -L ${service_url} -o /etc/systemd/system/trojan-web.service
-    systemctl daemon-reload
-    systemctl enable trojan-web
-    systemctl restart trojan-web
+# ------------------------------------------------------------
+# 启动 MariaDB 容器
+# ------------------------------------------------------------
+echo -e "${BLUE}🐬 启动 MariaDB 容器...${RESET}"
+docker run -d --name mariadb \
+  -e MARIADB_ROOT_PASSWORD=$DB_PASS \
+  -e MARIADB_USER=$DB_USER \
+  -e MARIADB_PASSWORD=$DB_PASS \
+  -e MARIADB_DATABASE=$DB_NAME \
+  -p 3306:3306 \
+  --restart unless-stopped mariadb:latest
 
-    SHARE_LINK="trojan://${ADMIN_PASS}@${DOMAIN}:${TROJAN_PORT}"
-    OPENCLASH_ENTRY="- {name: ${DOMAIN}, server: ${DOMAIN}, port: ${TROJAN_PORT}, type: trojan, password: ${ADMIN_PASS}}"
+echo -e "${GREEN}✅ MariaDB 已启动${RESET}"
 
-    colorEcho ${fuchsia} "\n===== 安装完成 ====="
-    echo "管理后台: https://${DOMAIN}"
-    echo "管理员账号: ${ADMIN_USER}"
-    echo "管理员密码: ${ADMIN_PASS}"
-    echo "数据库账号: ${DB_USER}"
-    echo "数据库密码: ${DB_PASS}"
-    echo
-    colorEcho ${green} "Trojan 链接: ${SHARE_LINK}"
-    echo "${OPENCLASH_ENTRY}"
-    echo "====================="
-}
+# ------------------------------------------------------------
+# 安装 acme.sh 并签发证书
+# ------------------------------------------------------------
+if [ ! -d ~/.acme.sh ]; then
+    echo -e "${BLUE}🔐 安装 acme.sh...${RESET}"
+    curl https://get.acme.sh | sh
+    source ~/.bashrc
+else
+    echo -e "${GREEN}✅ acme.sh 已安装${RESET}"
+fi
 
-uninstallTrojan(){
-    colorEcho ${yellow} "正在卸载 Trojan 与数据库..."
-    systemctl stop trojan-web >/dev/null 2>&1 || true
-    systemctl disable trojan-web >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/trojan-web.service
-    rm -rf /usr/local/etc/trojan /usr/local/bin/trojan
-    docker rm -f trojan-mariadb >/dev/null 2>&1 || true
-    rm -rf /home/mariadb
-    systemctl daemon-reload
-    colorEcho ${green} "卸载完成 ✅"
-}
+echo -e "${BLUE}🌍 使用 Let's Encrypt 签发证书...${RESET}"
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+~/.acme.sh/acme.sh --issue -d $DOMAIN --standalone --force --debug
 
-# === 主菜单 ===
-echo "==============================="
-echo " Trojan 一键安装管理脚本"
-echo "==============================="
-echo "1) 安装 Trojan"
-echo "2) 卸载 Trojan"
-echo "==============================="
-read -p "请输入数字 [1-2]: " num
+CERT_DIR="$HOME/.acme.sh/$DOMAIN"
+if [ -f "$CERT_DIR/fullchain.cer" ]; then
+    echo -e "${GREEN}✅ SSL 证书签发成功${RESET}"
+    echo -e "${BLUE}📁 证书路径:${RESET} $CERT_DIR"
+else
+    echo -e "${RED}❌ 证书签发失败，请检查日志${RESET}"
+    exit 1
+fi
 
-case "$num" in
-1)
-    readDomain
-    checkSys
-    installDependent
-    installMariaDB
-    installAcme
-    installTrojan
-    ;;
-2)
-    uninstallTrojan
-    ;;
-*)
-    echo "输入无效"
-    ;;
-esac
+# ------------------------------------------------------------
+# 输出结果
+# ------------------------------------------------------------
+echo "----------------------------------------------"
+echo -e "${GREEN}🎉 安装完成！${RESET}"
+echo "----------------------------------------------"
+echo -e "${BLUE}数据库信息:${RESET}"
+echo "  用户名: $DB_USER"
+echo "  密码:   $DB_PASS"
+echo "  数据库: $DB_NAME"
+echo "  端口:   3306"
+echo
+echo -e "${BLUE}SSL 证书位置:${RESET}"
+echo "  $CERT_DIR"
+echo
+echo -e "${YELLOW}✨ 提示：可使用以下命令查看数据库日志:${RESET}"
+echo "  docker logs -f mariadb"
+echo "----------------------------------------------"
