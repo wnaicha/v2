@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # 自动安装 Docker + MariaDB + SSL (acme.sh)
-# 作者: GPT-5 改进版
+# 作者: GPT-5 改进版（DNS智能检测增强）
 # ============================================================
 
 set -e
@@ -26,29 +26,57 @@ if [ -z "$DOMAIN" ]; then
     exit 1
 fi
 
-# 获取公网 IP
+# 获取服务器公网 IP
 SERVER_IP=$(curl -s https://ipinfo.io/ip || curl -s https://api.ipify.org)
+if [ -z "$SERVER_IP" ]; then
+    echo -e "${RED}❌ 无法获取公网 IP，请检查网络${RESET}"
+    exit 1
+fi
 echo -e "${BLUE}🌐 当前服务器公网 IP: ${RESET}${GREEN}$SERVER_IP${RESET}"
 
-# 检查域名解析
-DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
-if [ -z "$DOMAIN_IP" ]; then
-    echo -e "${RED}❌ 无法解析域名，请确认 DNS 已生效${RESET}"
-    exit 1
+# ------------------------------------------------------------
+# 检查 dig 工具是否存在
+# ------------------------------------------------------------
+if ! command -v dig >/dev/null 2>&1; then
+    echo -e "${YELLOW}🔍 检测到 dig 未安装，正在安装...${RESET}"
+    if command -v apt >/dev/null 2>&1; then
+        apt update -y && apt install -y dnsutils
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y bind-utils
+    else
+        echo -e "${RED}❌ 未检测到合适的包管理器（apt 或 yum）${RESET}"
+        exit 1
+    fi
 fi
 
-echo -e "${YELLOW}🔍 检测域名解析: ${RESET}$DOMAIN_IP"
-if [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
-    echo -e "${RED}❌ 域名未正确解析到本机！${RESET}"
-    echo "  你的域名解析 IP: $DOMAIN_IP"
-    echo "  服务器公网 IP:   $SERVER_IP"
-    echo -e "${YELLOW}请先将域名 A 记录解析到该 IP 再运行脚本。${RESET}"
-    exit 1
-fi
-echo -e "${GREEN}✅ 域名解析正确${RESET}"
+# ------------------------------------------------------------
+# 检查域名解析是否指向当前 IP（智能重试机制）
+# ------------------------------------------------------------
+MAX_RETRY=30
+RETRY_INTERVAL=10
+count=0
+echo -e "${BLUE}🔎 正在检测域名解析情况...${RESET}"
+
+while true; do
+    DOMAIN_IP=$(dig +short "$DOMAIN" | tail -n1)
+    if [ -z "$DOMAIN_IP" ]; then
+        echo -e "${YELLOW}⚠️  未检测到 $DOMAIN 的 A 记录，等待中 (${count}/${MAX_RETRY})...${RESET}"
+    elif [ "$DOMAIN_IP" != "$SERVER_IP" ]; then
+        echo -e "${YELLOW}⚠️  域名解析 IP: ${DOMAIN_IP} ≠ 服务器 IP: ${SERVER_IP}${RESET}"
+    else
+        echo -e "${GREEN}✅ 域名解析正确: ${DOMAIN_IP}${RESET}"
+        break
+    fi
+    count=$((count+1))
+    if [ $count -ge $MAX_RETRY ]; then
+        echo -e "${RED}❌ 域名未正确解析到服务器，退出安装！${RESET}"
+        echo -e "${YELLOW}请确认 DNS A 记录已指向: ${SERVER_IP}${RESET}"
+        exit 1
+    fi
+    sleep $RETRY_INTERVAL
+done
+
 echo "----------------------------------------------"
-
-# 选择操作
 echo -e "${BLUE}请选择操作:${RESET}"
 echo "1️⃣  安装 Docker + MariaDB + SSL"
 echo "2️⃣  卸载所有相关组件"
@@ -64,7 +92,7 @@ if [ "$OPTION" == "2" ]; then
     docker rm mariadb 2>/dev/null || true
     docker rmi mariadb:latest 2>/dev/null || true
     rm -rf ~/.acme.sh
-    apt remove -y docker docker.io containerd runc || true
+    apt remove -y docker docker.io containerd runc dnsutils || true
     apt autoremove -y
     echo -e "${GREEN}✅ 卸载完成${RESET}"
     exit 0
@@ -145,6 +173,10 @@ echo
 echo -e "${BLUE}SSL 证书位置:${RESET}"
 echo "  $CERT_DIR"
 echo
-echo -e "${YELLOW}✨ 提示：可使用以下命令查看数据库日志:${RESET}"
-echo "  docker logs -f mariadb"
+echo -e "${BLUE}📦 OpenClash配置示例:${RESET}"
+echo "- {name: trojan-$DOMAIN, server: $DOMAIN, port: 443, type: trojan, password: $DB_PASS}"
+echo
+echo -e "${YELLOW}✨ 可用命令:${RESET}"
+echo "  docker logs -f mariadb     查看数据库日志"
+echo "  sudo bash install.sh       重新运行本脚本"
 echo "----------------------------------------------"
